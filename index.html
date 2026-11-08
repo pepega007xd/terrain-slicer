@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Terrain Slicer</title>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+  <canvas id="lines"></canvas>
+
+  <aside id="panel">
+    <h1>Terrain Slicer</h1>
+
+    <section>
+      <h3>Terrain</h3>
+      <div class="btnrow">
+        <button id="btnLoad">Load EXR / PNG…</button>
+        <button id="btnSample">Sample</button>
+      </div>
+      <input type="file" id="file" accept=".exr,.png" hidden />
+      <div id="terrainInfo" class="info">—</div>
+      <label>Height scale <span id="heightVal">20%</span></label>
+      <input type="range" id="height" min="0" max="100" step="1" value="20" />
+    </section>
+
+    <section>
+      <h3>View</h3>
+      <div class="seg">
+        <button id="modeShaded">Shaded</button>
+        <button id="modeSlices" class="on">Slices</button>
+      </div>
+      <label>Projection <span id="projVal">Perspective</span></label>
+      <input type="range" id="proj" min="0" max="100" step="1" value="0" />
+    </section>
+
+    <section>
+      <h3>Slices</h3>
+      <label class="chk"><input type="checkbox" id="lock" checked /> Lock heading to camera</label>
+      <label>Heading <span id="headingVal">0°</span></label>
+      <input type="range" id="heading" min="0" max="360" step="0.5" value="0" disabled />
+      <label>Planes <span id="countVal">60</span></label>
+      <input type="range" id="count" min="0" max="100" step="1" value="54" />
+      <label>Precision <span id="precVal">75%</span></label>
+      <input type="range" id="precision" min="0" max="100" step="1" value="75" />
+      <div id="sliceInfo" class="info">—</div>
+    </section>
+
+    <section>
+      <h3>Line style</h3>
+      <div class="row"><label>Color</label><input type="color" id="lineColor" value="#ffffff" /></div>
+      <div class="row"><label>Background</label><input type="color" id="bgColor" value="#000000" /></div>
+      <label>Thickness <span id="thickVal">1.00</span></label>
+      <input type="range" id="thickness" min="0.25" max="10" step="0.25" value="1" />
+      <label>Antialiasing</label>
+      <select id="aa">
+        <option value="1" selected>Off (1×)</option>
+        <option value="2">2× supersampling</option>
+        <option value="3">3× supersampling</option>
+        <option value="4">4× supersampling</option>
+      </select>
+    </section>
+
+    <section>
+      <div class="btnrow">
+        <button id="btnSave">Save PNG</button>
+        <button id="btnReset">Reset view</button>
+      </div>
+      <div class="hint">Drag: orbit · Wheel: zoom · Right-drag / Shift-drag: pan<br>Drop an .exr or .png anywhere to load it.</div>
+    </section>
+  </aside>
+
+  <div id="toast" hidden></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
