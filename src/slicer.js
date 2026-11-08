@@ -1,27 +1,9 @@
 import * as THREE from 'three';
-import { samplePalette, rgbToCss, hexToRgb, srgbToLinear } from './palette.js';
+import { samplePalette, rgbToCss } from './palette.js';
 
 const MAX_SLICES = 800;
 const SAMPLE_BUDGET = 400000; // total samples across all slices per recompute
 const WORLD_V = 10;           // vertical reference scale for decimation (conservative)
-
-// Depth prepass material: writes each fragment's clip-space z/w (the exact
-// quantity the curve points are tested against) packed into R/G channels.
-// Used on the curtain mesh, not the terrain — the occluders are the planes
-// below the slice curves, never the terrain surface between planes.
-const depthVert = /* glsl */`
-  varying vec4 vClip;
-  void main() {
-    vec4 p = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
-    vClip = p;
-    gl_Position = p;
-  }`;
-const depthFrag = /* glsl */`
-  varying vec4 vClip;
-  void main() {
-    float t = clamp( 0.5 * vClip.z / vClip.w + 0.5, 0.0, 1.0 );
-    gl_FragColor = vec4( floor( t * 255.0 ) / 255.0, fract( t * 255.0 ), 0.0, 1.0 );
-  }`;
 
 /**
  * Slice renderer.
@@ -29,9 +11,15 @@ const depthFrag = /* glsl */`
  * A set of evenly spaced vertical planes (heading = azimuth of the plane
  * normals) intersects the terrain in curved polylines. Every frame the
  * polylines are projected with the active camera and drawn on a 2D canvas
- * from the farthest plane to the closest one. For each plane, everything
- * *below* its curve is first erased (destination-out), then the curve
- * itself is stroked — nearer curves thus occlude farther ones.
+ * from the farthest plane to the closest one, painter's-algorithm style:
+ *
+ *   1. the curtain — the slice's plane below its curve — is filled with the
+ *      slice's color (or erased to the sky when plane coloring is off),
+ *      covering everything farther behind it;
+ *   2. the curve itself is stroked on top.
+ *
+ * Because everything is drawn on one 2D canvas, what you see on screen and
+ * what gets exported are pixel-identical by construction.
  *
  * Points are stored with y normalized to [0,1] and multiplied by
  * terrain.heightScale only at projection time, so changing the vertical
@@ -42,22 +30,17 @@ export class SliceRenderer {
     this.headingDeg = 0;
     this.locked = true;
     this.lineCount = 60;
-    this.color = '#ffffff';
-    this.bgColor = '#000000';
-    this.thickness = 1.0;
-    this.aa = 1;            // supersampling factor per axis
-    this.renderScale = 1;   // device pixels per css pixel (dpr * aa), set by main
-    this.depthBias = 1.5;   // visibility bias in grid cells (covers rasterization/sampling mismatch)
-    this.dpEpsMult = 0.5;   // decimation epsilon multiplier (0 = full detail)
-    this.debugSlice = -1;   // when >= 0, draw only this slice (debugging)
     // Line coloring
     this.lineColorMode = 'gradient';    // 'static' | 'gradient'
     this.linePalette = null;            // { mode: 'rgb'|'hsv', stops: [{t, color:[r,g,b]}] }, set by main
     // Curtain ("slice plane") coloring — always palette-based
     this.curtainPalette = null;
-    this._sliceColors = []; // css color per slice index, recomputed per frame
-    this._dists = new Float32Array(0);  // camera-plane distance per slice
-    this._sliceColRgb = [];             // [r,g,b] per slice for the fill layer
+    this.color = '#ffffff';             // flat line color for the Static mode
+    this.thickness = 1.0;
+    this.aa = 1;                        // supersampling factor per axis
+    this.renderScale = 1;               // device pixels per css pixel (dpr * aa), set by main
+    this.dpEpsMult = 0.5;               // decimation epsilon multiplier (0 = full detail)
+    this.debugSlice = -1;               // when >= 0, draw only this slice (debugging)
 
     this.key = null;
     this.nx = 0; this.nz = 1;
@@ -70,31 +53,6 @@ export class SliceRenderer {
     this.count = new Int32Array(0);   // point count per slice
     this.cvals = new Float32Array(0); // plane offset along normal per slice
 
-    // Curtain geometry for the depth prepass: for every curve point a vertex
-    // pair (curve point, its ground projection), triangulated per segment.
-    // The occluder of a slice is exactly this vertical curtain — the terrain
-    // between planes must never occlude (looking between planes must show
-    // what is behind them).
-    this.curtainPos = new Float32Array(0); // xyz per vertex, y normalized (mesh scale.y = heightScale)
-    this.curtainCol = new Float32Array(0); // rgb per vertex (linear 0..1), written per frame
-    this.curtainIdx = new Uint32Array(0);  // 6 indices per segment
-    this.curtainVertBase = new Int32Array(0); // first vertex index per slice
-    this._curtainGeo = new THREE.BufferGeometry();
-    this._applyCurtainAttributes();
-    this.curtainMesh = new THREE.Mesh(this._curtainGeo, new THREE.ShaderMaterial({
-      vertexShader: depthVert,
-      fragmentShader: depthFrag,
-      side: THREE.DoubleSide,
-    }));
-    this.curtainMesh.frustumCulled = false;
-    // Colored twin of the curtain mesh for the visible "plane bands"
-    // (rendered by main.js into a separate transparent WebGL layer).
-    this.fillMesh = new THREE.Mesh(this._curtainGeo, new THREE.MeshBasicMaterial({
-      vertexColors: true,
-      side: THREE.DoubleSide,
-    }));
-    this.fillMesh.frustumCulled = false;
-
     this._scratch = new Float32Array(1600 * 3);
     this._keep = new Uint8Array(1600);
     this._stack = new Int32Array(1600 * 2);
@@ -102,23 +60,9 @@ export class SliceRenderer {
     this._sy = new Float32Array(0);
     this._sv = new Uint8Array(0);
     this._order = new Int32Array(0);
-    this._keys = new Float32Array(0);
+    this._dists = new Float32Array(0);  // camera-plane distance per slice
+    this._sliceColors = [];             // css color per slice index
     this._m = new THREE.Matrix4();
-  }
-
-  /** Both curtain consumers must match the terrain's vertical scale. */
-  setCurtainScale(h) {
-    this.curtainMesh.scale.y = h;
-    this.fillMesh.scale.y = h;
-  }
-
-  _applyCurtainAttributes() {
-    this._curtainGeo.setAttribute('position',
-      new THREE.BufferAttribute(this.curtainPos, 3).setUsage(THREE.DynamicDrawUsage));
-    this._curtainGeo.setAttribute('color',
-      new THREE.BufferAttribute(this.curtainCol, 3).setUsage(THREE.DynamicDrawUsage));
-    this._curtainGeo.setIndex(
-      new THREE.BufferAttribute(this.curtainIdx, 1).setUsage(THREE.DynamicDrawUsage));
   }
 
   invalidate() { this.key = null; }
@@ -126,8 +70,8 @@ export class SliceRenderer {
   /**
    * Per-slice color as [r,g,b] (0..255): sampled from the palette by the
    * slice's perpendicular distance from the camera (nearest = left palette
-   * end, farthest = right end), or null when palette coloring is off
-   * (callers fall back to the flat line color).
+   * end, farthest = right end), or null when gradient coloring is off
+   * (callers fall back to the flat color).
    */
   sliceColorsRgb(camera, gradient, palette) {
     const nS = this.numSlices;
@@ -138,7 +82,7 @@ export class SliceRenderer {
     const pos = camera.position;
     const ref = this.nx * pos.x + this.nz * pos.z;
     let dmin = Infinity, dmax = -Infinity;
-    const dists = this._dists = _grow(this._dists, nS);
+    const dists = this._dists = grow(this._dists, nS);
     for (let i = 0; i < nS; i++) {
       const d = Math.abs(this.cvals[i] - ref);
       dists[i] = d;
@@ -146,38 +90,12 @@ export class SliceRenderer {
       if (d > dmax) dmax = d;
     }
     const dr = dmax - dmin;
-    const out = this._sliceColRgb = _grow(this._sliceColRgb, nS);
+    const out = new Array(nS);
     for (let i = 0; i < nS; i++) {
       const t = dr > 1e-9 ? (dists[i] - dmin) / dr : 0.5;
       out[i] = samplePalette(palette, t);
     }
     return out;
-  }
-
-  /**
-   * Write the per-slice colors into the curtain mesh's color attribute
-   * (converted to linear space for GPU rendering). Call before rendering the
-   * fill layer; colors change whenever the camera or palette changes.
-   */
-  updateCurtainColors(camera) {
-    const nS = this.numSlices;
-    if (nS === 0) return;
-    const colAttr = this._curtainGeo.attributes.color;
-    if (!colAttr) return;
-    const cols = this.sliceColorsRgb(camera, true, this.curtainPalette);
-    if (!cols) return; // no valid curtain palette
-    const arr = colAttr.array;
-    for (let si = 0; si < nS; si++) {
-      const c = cols[si];
-      const r = srgbToLinear(c[0]), g = srgbToLinear(c[1]), b = srgbToLinear(c[2]);
-      const vBase = this.curtainVertBase[si], n = this.count[si];
-      for (let k = 0; k < n; k++) {
-        const vi = (vBase + k * 2) * 3;
-        arr[vi] = r; arr[vi + 1] = g; arr[vi + 2] = b;
-        arr[vi + 3] = r; arr[vi + 4] = g; arr[vi + 5] = b;
-      }
-    }
-    colAttr.needsUpdate = true;
   }
 
   compute(terrain, headingRad, lineCount) {
@@ -190,7 +108,7 @@ export class SliceRenderer {
     const cell = terrain.cell;
     const nx = Math.sin(headingRad), nz = Math.cos(headingRad);
     this.nx = nx; this.nz = nz;
-    const ux = nz, uz = -nx; // in-plane horizontal direction
+    const ux = nz, uz = -nx;
     const x0 = -sx / 2, x1 = sx / 2, z0 = -sz / 2, z1 = sz / 2;
 
     let cmin = Infinity, cmax = -Infinity;
@@ -210,14 +128,13 @@ export class SliceRenderer {
 
     const maxPts = count * maxPerLine;
     if (this.pts.length < maxPts * 3) this.pts = new Float32Array(maxPts * 3);
-    this.start = _grow(this.start, count);
-    this.count = _grow(this.count, count);
-    this.cvals = _grow(this.cvals, count);
-    this._sx = _grow(this._sx, maxPts);
-    this._sy = _grow(this._sy, maxPts);
-    this._sv = _grow(this._sv, maxPts);
-    this._order = _grow(this._order, count);
-    this._keys = _grow(this._keys, count);
+    this.start = grow(this.start, count);
+    this.count = grow(this.count, count);
+    this.cvals = grow(this.cvals, count);
+    this._order = grow(this._order, count);
+    this._sx = grow(this._sx, maxPts);
+    this._sy = grow(this._sy, maxPts);
+    this._sv = grow(this._sv, maxPts);
 
     const pts = this.pts;
     const invGx = (gw - 1) / sx, invGz = (gh - 1) / sz;
@@ -265,52 +182,6 @@ export class SliceRenderer {
       ns++;
     }
     this.numSlices = ns;
-    this._pointTotal = w;
-    this._buildCurtains();
-  }
-
-  // (Re)fill the curtain geometry from the current slices: per curve point a
-  // vertex pair (curve point at normalized y, its projection on the ground),
-  // indexed into two triangles per segment. The mesh's scale.y carries the
-  // height scale, so height changes don't require a rebuild.
-  _buildCurtains() {
-    const totalPts = this._pointTotal;
-    const totalSegs = totalPts - this.numSlices;
-    const needV = totalPts * 2, needI = totalSegs * 6;
-    if (this.curtainPos.length < needV * 3 || this.curtainIdx.length < needI) {
-      this.curtainPos = new Float32Array(Math.max(needV * 3, (this.curtainPos.length * 1.5) | 0));
-      this.curtainCol = new Float32Array(this.curtainPos.length);
-      this.curtainIdx = new Uint32Array(Math.max(needI, (this.curtainIdx.length * 1.5) | 0));
-      this._applyCurtainAttributes();
-    }
-    this.curtainVertBase = _grow(this.curtainVertBase, this.numSlices);
-    const pts = this.pts, pos = this.curtainPos, idx = this.curtainIdx;
-    let v = 0, ic = 0;
-    for (let si = 0; si < this.numSlices; si++) {
-      const s0 = this.start[si], n = this.count[si];
-      this.curtainVertBase[si] = v;
-      const vBase = v;
-      for (let k = 0; k < n; k++) {
-        const p = (s0 + k) * 3, q = v * 3;
-        pos[q] = pts[p];
-        pos[q + 1] = pts[p + 1]; // normalized y; bottom vertex below is 0
-        pos[q + 2] = pts[p + 2];
-        pos[q + 3] = pts[p];
-        pos[q + 4] = 0;
-        pos[q + 5] = pts[p + 2];
-        v += 2;
-      }
-      for (let k = 0; k + 1 < n; k++) {
-        const a = vBase + k * 2, b = a + 2;
-        idx[ic++] = a;     idx[ic++] = b;     idx[ic++] = a + 1;
-        idx[ic++] = a + 1; idx[ic++] = b;     idx[ic++] = b + 1;
-      }
-    }
-    this.curtainVertCount = v;
-    const geo = this._curtainGeo;
-    geo.attributes.position.needsUpdate = true;
-    geo.index.needsUpdate = true;
-    geo.setDrawRange(0, ic);
   }
 
   // Douglas-Peucker in the (t-in-cells, height*WORLD_V) plane; writes keep
@@ -325,9 +196,9 @@ export class SliceRenderer {
     stack[sp++] = 0; stack[sp++] = n - 1;
     while (sp > 0) {
       const end = stack[--sp], beg = stack[--sp];
-      const ax = 0, ay = sc[beg * 3 + 1] * WORLD_V;
+      const ay = sc[beg * 3 + 1] * WORLD_V;
       const bx = (end - beg) * cellsPerIndex, by = sc[end * 3 + 1] * WORLD_V;
-      const dx = bx - ax, dy = by - ay;
+      const dx = bx, dy = by - ay;
       const L = Math.hypot(dx, dy);
       let maxD = -1, maxI = -1;
       for (let k = beg + 1; k < end; k++) {
@@ -351,16 +222,15 @@ export class SliceRenderer {
    * Draw one frame. w/h are CSS-pixel viewport dimensions; the context must
    * already carry the transform mapping CSS px -> device px.
    *
-   * `depth` is the curtain depth buffer rendered from the same camera (by
-   * main.js, via curtainMesh): { data: Float32Array (row 0 = bottom), w, h }.
-   * Each curve point is tested against the nearest curtain at its pixel, so
-   * lines are hidden exactly where a nearer slice's plane-below-the-curve
-   * covers them — the classic ridge-plot occlusion, correct from any view
-   * direction. Looking between two planes shows whatever is behind them.
+   * drawPlanes: fill each slice's curtain (its plane below the curve) with
+   * the slice's gradient color; when false, the curtains are erased to the
+   * sky instead (classic black bands). drawLines: stroke the curves.
+   * Both are drawn far -> near, so nearer planes occlude farther ones.
    */
-  render(ctx, camera, terrain, w, h, depth) {
+  render(ctx, camera, terrain, w, h, drawPlanes, drawLines) {
     const nS = this.numSlices;
     if (nS === 0) return;
+    if (!drawPlanes && !drawLines) return;
     camera.updateMatrixWorld(true);
     this._m.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const e = this._m.elements;
@@ -370,29 +240,15 @@ export class SliceRenderer {
     const pos = camera.position;
     const sigmaRef = this.nx * pos.x + this.nz * pos.z;
 
-    const isPersp = camera.isPerspectiveCamera === true;
-    const p10 = camera.projectionMatrix.elements[10];
-    const p14 = camera.projectionMatrix.elements[14];
-    const useDepth = !!depth;
-    const biasWorld = terrain.cell * this.depthBias;
-
     // Sort planes far -> near. For parallel planes this is |offset - ref|,
     // which is correct both when the camera is on one side of all planes
-    // and when it sits between them.
-    const order = this._order, keys = this._keys, cv = this.cvals;
-    for (let i = 0; i < nS; i++) {
-      order[i] = i;
-      keys[i] = Math.abs(cv[i] - sigmaRef);
-    }
-    order.sort((a, b) => keys[b] - keys[a]);
-
-    // Slice colors by camera distance (shared with the curtain fill layer).
-    const colsRgb = this.sliceColorsRgb(camera, this.lineColorMode === 'gradient', this.linePalette);
-    let sliceColors = null;
-    if (colsRgb) {
-      sliceColors = this._sliceColors = _grow(this._sliceColors, nS);
-      for (let i = 0; i < nS; i++) sliceColors[i] = rgbToCss(colsRgb[i]);
-    }
+    // and when it sits between them. Sort only the active prefix: the typed
+    // arrays keep stale entries from a previous larger slice count, and
+    // sorting the full array would let ghost slices into the draw order.
+    const order = this._order, cv = this.cvals;
+    for (let i = 0; i < nS; i++) order[i] = i;
+    order.subarray(0, nS).sort((a, b) =>
+      Math.abs(cv[b] - sigmaRef) - Math.abs(cv[a] - sigmaRef));
 
     const hs = terrain.heightScale;
     const pts = this.pts, sxr = this._sx, syr = this._sy, svr = this._sv;
@@ -401,135 +257,95 @@ export class SliceRenderer {
     const m2 = e[2], m6 = e[6], m10 = e[10], m14 = e[14];
     const m3 = e[3], m7 = e[7], m11 = e[11], m15 = e[15];
     const pad = 64;
-    let cst = 0, cpx = 0, cpy = 0; // classify() outputs
+    const yBottom = h + 64;
 
-    const dbg = this.debug = { total: nS, tiny: 0, noValid: 0, offscreen: 0, drawn: 0, ptsCulled: 0, ptsHidden: 0, subTests: 0 };
+    const lineCols = this.sliceColorsRgb(camera, this.lineColorMode === 'gradient', this.linePalette);
+    const fillCols = this.sliceColorsRgb(camera, true, this.curtainPalette);
 
-    // Classify one world-space point: 0 = behind near plane / unprojectable,
-    // 1 = visible, 2 = hidden behind a nearer curtain. Screen coords go to
-    // cpx/cpy. Used for the curve points and for subdivision midpoints.
-    const classify = (x, y, z) => {
-      const vz = vz2 * x + vz6 * y + vz10 * z + vz14;
-      if (!(vz < -near)) { cst = 0; return; }
-      const cw = m3 * x + m7 * y + m11 * z + m15;
-      if (!(cw > 1e-9)) { cst = 0; return; }
-      const inv = 1 / cw;
-      const ndcX = (m0 * x + m4 * y + m8 * z + m12) * inv;
-      const ndcY = (m1 * x + m5 * y + m9 * z + m13) * inv;
-      const px = (ndcX * 0.5 + 0.5) * w;
-      const py = (0.5 - ndcY * 0.5) * h;
-      if (!(Number.isFinite(px) && Number.isFinite(py))) { cst = 0; return; }
-      if (useDepth) {
-        // sample nearest curtain depth at this pixel (buffer row 0 = bottom);
-        // take the max of the 2x2 neighborhood so points win ties at
-        // silhouette edges and steep depth gradients (fewer dropouts)
-        let fx = ((ndcX * 0.5 + 0.5) * depth.w) | 0;
-        let fy = ((0.5 - ndcY * 0.5) * depth.h) | 0;
-        fx = fx < 0 ? 0 : fx >= depth.w ? depth.w - 1 : fx;
-        fy = fy < 0 ? 0 : fy >= depth.h ? depth.h - 1 : fy;
-        const fx1 = fx < depth.w - 1 ? fx + 1 : fx;
-        const fy1 = fy < depth.h - 1 ? fy + 1 : fy;
-        const row0 = (depth.h - 1 - fy) * depth.w;
-        const row1 = (depth.h - 1 - fy1) * depth.w;
-        const d00 = depth.data[row0 + fx], d10 = depth.data[row0 + fx1];
-        const d01 = depth.data[row1 + fx], d11 = depth.data[row1 + fx1];
-        const surf = d00 > d10 ? (d01 > d11 ? (d00 > d01 ? d00 : d01) : (d00 > d11 ? d00 : d11))
-          : (d01 > d11 ? (d10 > d01 ? d10 : d01) : (d10 > d11 ? d10 : d11));
-        if (surf < 0.9995) { // 1.0 = clear color = no curtain (sky)
-          const zNdc = (m2 * x + m6 * y + m10 * z + m14) * inv;
-          const pd = (zNdc + 1) * 0.5;
-          // world-space bias -> NDC -> [0,1]
-          const dzdv = isPersp ? Math.abs(p14) / (vz * vz) : Math.abs(p10);
-          const bias = dzdv * biasWorld * 0.5;
-          if (pd > surf + bias) { cst = 2; cpx = px; cpy = py; return; }
-        }
-      }
-      cst = 1; cpx = px; cpy = py;
-    };
-
-    // Adaptive subdivision: decimated segments can be long, and testing only
-    // their endpoints makes them pop in/out whole (or draw straight sections
-    // over nearer curtains). Each pair is midpoint-tested and split until the
-    // pieces are short, with a finer threshold where visibility flips, so
-    // occlusion boundaries resolve to a few pixels.
-    const SUBDIV_PX = 12;   // same-visibility pairs longer than this get split
-    const BOUNDARY_PX = 3;  // visibility-flip pairs refined to this length
-    const HIDDEN_PX = 24;   // hidden-hidden pairs (coarser: hidden spans are long)
-    const MAX_DEPTH = 7;
+    const dbg = this.debug = { total: nS, tiny: 0, noValid: 0, offscreen: 0, drawn: 0, ptsCulled: 0 };
 
     for (let oi = 0; oi < nS; oi++) {
       const si = order[oi];
       if (this.debugSlice >= 0 && si !== this.debugSlice) continue;
       const s0 = this.start[si], n = this.count[si];
       if (n < 2) { dbg.tiny++; continue; }
-      let minx = Infinity, maxx = -Infinity, anyProj = false;
+      let minx = Infinity, maxx = -Infinity, miny = Infinity, anyProj = false;
       for (let k = 0; k < n; k++) {
         const pi = (s0 + k) * 3;
-        classify(pts[pi], pts[pi + 1] * hs, pts[pi + 2]);
-        const st = cst;
-        sxr[s0 + k] = cpx; syr[s0 + k] = cpy; svr[s0 + k] = st;
-        if (st === 0) dbg.ptsCulled++;
+        const x = pts[pi], y = pts[pi + 1] * hs, z = pts[pi + 2];
+        const vz = vz2 * x + vz6 * y + vz10 * z + vz14;
+        const cw = m3 * x + m7 * y + m11 * z + m15;
+        let ok = vz < -near && cw > 1e-9;
+        let px = 0, py = 0;
+        if (ok) {
+          const inv = 1 / cw;
+          px = ((m0 * x + m4 * y + m8 * z + m12) * inv * 0.5 + 0.5) * w;
+          py = (0.5 - (m1 * x + m5 * y + m9 * z + m13) * inv * 0.5) * h;
+          if (!Number.isFinite(px) || !Number.isFinite(py)) ok = false;
+        }
+        sxr[s0 + k] = px; syr[s0 + k] = py; svr[s0 + k] = ok ? 1 : 0;
+        if (!ok) dbg.ptsCulled++;
         else {
           anyProj = true;
-          if (st === 2) dbg.ptsHidden++;
-          if (cpx < minx) minx = cpx;
-          if (cpx > maxx) maxx = cpx;
+          if (px < minx) minx = px;
+          if (px > maxx) maxx = px;
+          if (py < miny) miny = py;
         }
       }
       if (!anyProj) { dbg.noValid++; continue; }
-      if (maxx < -pad || minx > w + pad) { dbg.offscreen++; continue; }
+      if (maxx < -pad || minx > w + pad || miny > h + pad) { dbg.offscreen++; continue; }
 
-      // Emit one sub-point; visible points extend the current run, anything
-      // else closes it.
       const strokePath = new Path2D();
-      let runOpen = false;
-      const emit = (px, py, st) => {
-        if (st === 1) {
-          if (runOpen) strokePath.lineTo(px, py);
-          else { strokePath.moveTo(px, py); runOpen = true; }
-        } else {
-          runOpen = false;
-        }
-      };
-
-      const subPair = (ax, ay, az, pax, pay, stA, bx, by, bz, pbx, pby, stB, depth) => {
-        if (stA === 0 && stB === 0) return;
-        let len = Infinity;
-        if (stA !== 0 && stB !== 0) len = Math.hypot(pbx - pax, pby - pay);
-        const thr = stA !== stB ? BOUNDARY_PX : (stA === 2 ? HIDDEN_PX : SUBDIV_PX);
-        if (depth >= MAX_DEPTH || len <= thr) { emit(pbx, pby, stB); return; }
-        const mx = (ax + bx) * 0.5, my = (ay + by) * 0.5, mz = (az + bz) * 0.5;
-        classify(mx, my, mz);
-        const stM = cst, pmx = cpx, pmy = cpy;
-        dbg.subTests++;
-        subPair(ax, ay, az, pax, pay, stA, mx, my, mz, pmx, pmy, stM, depth + 1);
-        subPair(mx, my, mz, pmx, pmy, stM, bx, by, bz, pbx, pby, stB, depth + 1);
-      };
-
-      emit(sxr[s0], syr[s0], svr[s0]);
-      for (let k = 0; k + 1 < n; k++) {
-        const j = s0 + k, stA = svr[j], stB = svr[j + 1];
-        if (stA === 1 && stB === 1) {
-          const dx = sxr[j + 1] - sxr[j], dy = syr[j + 1] - syr[j];
-          if (dx * dx + dy * dy <= SUBDIV_PX * SUBDIV_PX) {
-            strokePath.lineTo(sxr[j + 1], syr[j + 1]);
-            continue;
+      const fillPath = drawPlanes ? new Path2D() : null;
+      let runStart = -1;
+      for (let k = 0; k <= n; k++) {
+        const valid = k < n ? svr[s0 + k] : 0;
+        if (valid && runStart < 0) runStart = k;
+        else if (!valid && runStart >= 0) {
+          const runEnd = k - 1;
+          if (runEnd > runStart) {
+            const x0p = sxr[s0 + runStart], y0p = syr[s0 + runStart];
+            strokePath.moveTo(x0p, y0p);
+            if (fillPath) fillPath.moveTo(x0p, y0p);
+            for (let q = runStart + 1; q <= runEnd; q++) {
+              strokePath.lineTo(sxr[s0 + q], syr[s0 + q]);
+              if (fillPath) fillPath.lineTo(sxr[s0 + q], syr[s0 + q]);
+            }
+            if (fillPath) {
+              // the curtain: from the curve down to the bottom of the frame
+              fillPath.lineTo(sxr[s0 + runEnd], yBottom);
+              fillPath.lineTo(x0p, yBottom);
+              fillPath.closePath();
+            }
           }
+          runStart = -1;
         }
-        subPair(pts[j * 3], pts[j * 3 + 1] * hs, pts[j * 3 + 2], sxr[j], syr[j], stA,
-          pts[j * 3 + 3], pts[j * 3 + 4] * hs, pts[j * 3 + 5], sxr[j + 1], syr[j + 1], stB, 0);
       }
-      ctx.strokeStyle = sliceColors ? sliceColors[si] : this.color;
-      ctx.lineWidth = this.thickness;
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-      ctx.stroke(strokePath);
+      if (fillPath) {
+        if (drawPlanes) {
+          ctx.fillStyle = fillCols ? rgbToCss(fillCols[si]) : this.color;
+          ctx.fill(fillPath, 'nonzero');
+        } else {
+          // classic look: erase the band to the sky (the canvas is
+          // transparent there, the page background shows through)
+          ctx.globalCompositeOperation = 'destination-out';
+          ctx.fillStyle = '#000';
+          ctx.fill(fillPath, 'nonzero');
+          ctx.globalCompositeOperation = 'source-over';
+        }
+      }
+      if (drawLines) {
+        ctx.strokeStyle = lineCols ? rgbToCss(lineCols[si]) : this.color;
+        ctx.lineWidth = this.thickness;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.stroke(strokePath);
+      }
       dbg.drawn++;
     }
-    ctx.globalCompositeOperation = 'source-over';
   }
 }
 
-function _grow(arr, n) {
+function grow(arr, n) {
   return arr.length >= n ? arr : new arr.constructor(n);
 }

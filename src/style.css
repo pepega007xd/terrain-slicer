@@ -9,7 +9,7 @@ html, body {
   user-select: none;
 }
 
-#gl, #fills, #lines {
+#gl, #lines {
   position: fixed;
   inset: 0;
   width: 100vw;
@@ -18,10 +18,9 @@ html, body {
   cursor: grab;
   touch-action: none;
 }
-#fills, #lines { display: none; }
-#fills { background: var(--slice-bg, #000); }
+#lines { display: none; background: var(--slice-bg, #000); }
 #gl { display: block; }
-body.slices #lines, body.slices #fills { display: block; }
+body.slices #lines { display: block; }
 body.slices #gl { display: none; }
 body.dragging #gl, body.dragging #lines { cursor: grabbing; }
 

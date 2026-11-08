@@ -2,9 +2,9 @@
 
 A web tool for viewing terrain as **ridge-line slices**: many parallel, evenly
 spaced vertical planes intersect the terrain, and the intersection curves are
-rendered far-to-near so that nearer lines occlude farther ones (everything
-below a drawn line is erased) — the classic "ridge plot" look, rendered live
-in 3D.
+rendered far-to-near, painter's-algorithm style — each slice fills its plane
+below the curve (occluding everything farther behind it) and then draws its
+line — the classic "ridge plot" look, rendered live in 3D.
 
 ![slices](docs/slices.png)
 
@@ -35,21 +35,19 @@ Production build: `npm run build` (output in `dist/`, serve with any static serv
     adaptively subdivided at render time and midpoint-tested against the
     curtains, so occlusion boundaries resolve to a few pixels and segments
     never pop in or out as a whole.
-  - *Occlusion* — nearer slice lines hide farther ones exactly where the
-    nearer slice's **plane below its curve** covers them: each slice acts as
-    an opaque curtain from its curve down to the ground, and the space
-    between adjacent planes is empty, so looking between planes shows what is
-    behind them. This is implemented with a small GPU depth prepass: the
-    curtains are rendered from the active camera each frame and every curve
-    point is depth-tested against them, which stays correct from any view
-    direction (top-down, parallel to the planes, zoomed in, …) while being
-    faster than per-line screen-space erasing.
+  - *Occlusion* — painter's algorithm: slices are drawn far to near, each one
+    first filling its plane below the curve (with its gradient color, or
+    erasing to the sky when *Color planes* is off) and then drawing its line.
+    The space between adjacent planes is empty, so looking between planes
+    shows what is behind them, and the terrain between the planes never
+    occludes anything. Everything is drawn on one 2D canvas, so the screen
+    and the exported PNG match pixel for pixel.
   - *Line style* — *Lines* toggle; color mode as two joined buttons,
     **Static** (flat color) or **Gradient** (palette by distance); thickness;
     and antialiasing (off/2×/3×/4× supersampling).
-  - *Slice style* — *Planes* toggle (the curtains below the lines) and its own
-    gradient palette, always distance-based (nearest bands `#241f31`, fading
-    to black in the distance).
+  - *Slice style* — *Planes* toggle (the curtains below the lines) and their
+    own gradient palette, always distance-based (default: dark violet `#241f31`
+    for the nearest bands fading to black in the distance).
   - **Palette editor** (Gradient mode) — click the gradient bar to add stops,
     drag stops to move them, double-click a stop to open the color picker,
     right-click a stop to delete it, and interpolate between stops in RGB or

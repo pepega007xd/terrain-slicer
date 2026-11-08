@@ -34,79 +34,10 @@ scene.add(new THREE.AmbientLight(0xffffff, 0.55));
 const lineCanvas = $('lines');
 const lctx = lineCanvas.getContext('2d');
 
-// --- curtain depth prepass (for exact slice occlusion) ---------------------
-// The slice renderer's curtain mesh (one vertical "wall" below each slice
-// curve) is rendered from the active camera into a small render target. A
-// custom shader stores each fragment's clip-space z/w (the exact quantity the
-// curve points are tested against) packed into the R/G channels — no reliance
-// on three's depth packing/mapping conventions. The nearest curtain at each
-// pixel then occludes farther slice lines; the terrain between the planes
-// never occludes, so looking between planes shows what is behind them.
-let depthRT = null;
-let depthBuf = null;
-let depthData = null;
-let lastDepthStats = null;
-const DEPTH_SCALE = 0.5; // fraction of CSS viewport size
-const depthScene = new THREE.Scene();
-depthScene.add(slicer.curtainMesh);
-
-// --- colored curtain fills (the visible bands between the lines) -----------
-// A second transparent WebGL layer under the 2D line canvas renders the
-// curtain mesh with per-slice vertex colors; the GPU depth test resolves
-// curtain-vs-curtain occlusion exactly, and the sky stays transparent so the
-// background color shows through.
-const fillCanvas = $('fills');
-const fillRenderer = new THREE.WebGLRenderer({ canvas: fillCanvas, alpha: true, antialias: true });
-fillRenderer.setClearColor(0x000000, 0);
-const fillScene = new THREE.Scene();
-fillScene.add(slicer.fillMesh);
-
-function resizeFillRenderer() {
-  fillRenderer.setPixelRatio(dpr());
-  fillRenderer.setSize(window.innerWidth, window.innerHeight, false);
-}
-
-function resizeDepthRT() {
-  const w = Math.max(2, Math.round(window.innerWidth * DEPTH_SCALE));
-  const h = Math.max(2, Math.round(window.innerHeight * DEPTH_SCALE));
-  if (depthRT && depthRT.width === w && depthRT.height === h) return;
-  if (depthRT) depthRT.dispose();
-  depthRT = new THREE.WebGLRenderTarget(w, h, {
-    minFilter: THREE.NearestFilter,
-    magFilter: THREE.NearestFilter,
-    depthBuffer: true,
-    generateMipmaps: false,
-  });
-  depthBuf = new Uint8Array(w * h * 4);
-  depthData = new Float32Array(w * h);
-}
-
-function renderDepthBuffer() {
-  resizeDepthRT();
-  const cam = rig.activeCamera;
-  cam.updateMatrixWorld(true);
-  renderer.setClearColor(0xffffff, 1); // sky = t 1.0 = no curtain
-  renderer.setRenderTarget(depthRT);
-  renderer.render(depthScene, cam);
-  renderer.setRenderTarget(null);
-  renderer.setClearColor(0x0d0f13, 1);
-  renderer.readRenderTargetPixels(depthRT, 0, 0, depthRT.width, depthRT.height, depthBuf);
-  // shader packed t = (clip.z/clip.w + 1)/2 as (floor(t*255), fract(t*255))
-  const n = depthRT.width * depthRT.height;
-  let mn = 1, mx = 0;
-  for (let i = 0; i < n; i++) {
-    const o = i * 4;
-    const d = (depthBuf[o] + depthBuf[o + 1] / 255) / 255;
-    depthData[i] = d;
-    if (d < mn) mn = d;
-    if (d > mx) mx = d;
-  }
-  lastDepthStats = { mn, mx, w: depthRT.width, h: depthRT.height };
-  return { data: depthData, w: depthRT.width, h: depthRT.height };
-}
-
 let needsRender = true;
-const invalidate = () => { needsRender = true; };// --- sizing ---------------------------------------------------------------
+const invalidate = () => { needsRender = true; };
+
+// --- sizing ---------------------------------------------------------------
 function dpr() { return Math.min(window.devicePixelRatio || 1, 2); }
 
 function resizeLineCanvas() {
@@ -127,7 +58,6 @@ function applyTerrain() {
   mesh.geometry.dispose();
   mesh.geometry = buildTerrainGeometry(terrain, 1024);
   mesh.scale.y = terrain.heightScale;
-  slicer.setCurtainScale(terrain.heightScale);
   rig.bounds = { size: WORLD_SIZE, height: terrain.heightScale };
   rig.target.y = terrain.heightScale / 2;
   $('terrainInfo').textContent =
@@ -232,28 +162,25 @@ function savePNG() {
     renderer.render(scene, rig.activeCamera); // ensure fresh buffer
     out = glCanvas;
   } else {
-    // Re-render the slice view offscreen. Supersample at least 2x (or at the
+    // Re-render the slice view offscreen at 2x supersampling (or at the
     // user's chosen level when higher), capped like the display canvas.
+    // The slices are drawn into a transparent canvas first (their "erase"
+    // cuts must reach transparency), then composited over the background.
     const w = window.innerWidth, h = window.innerHeight;
     let scale = dpr() * Math.max(2, slicer.aa);
     if (w * h * scale * scale > 28e6) scale = Math.max(1, Math.sqrt(28e6 / (w * h)));
+    const tmp = document.createElement('canvas');
+    tmp.width = Math.max(1, Math.round(w * scale));
+    tmp.height = Math.max(1, Math.round(h * scale));
+    const tx = tmp.getContext('2d');
+    drawSliceFrame(tmp, tx, scale, w, h, true);
     const c = document.createElement('canvas');
-    c.width = Math.max(1, Math.round(w * scale));
-    c.height = Math.max(1, Math.round(h * scale));
+    c.width = tmp.width;
+    c.height = tmp.height;
     const cx = c.getContext('2d');
     cx.fillStyle = slicer.bgColor;
     cx.fillRect(0, 0, c.width, c.height);
-    if (state.showPlanes) {
-      // render the colored curtain fills at the export resolution too
-      fillRenderer.setPixelRatio(1);
-      fillRenderer.setSize(c.width, c.height, false);
-      slicer.updateCurtainColors(rig.activeCamera);
-      fillRenderer.render(fillScene, rig.activeCamera);
-      cx.drawImage(fillCanvas, 0, 0, c.width, c.height);
-      fillRenderer.setPixelRatio(dpr());
-      fillRenderer.setSize(w, h, false);
-    }
-    if (state.showLines) drawSliceFrame(c, cx, scale, w, h, false);
+    cx.drawImage(tmp, 0, 0);
     out = c;
   }
   out.toBlob((blob) => {
@@ -386,31 +313,20 @@ function tick() {
     renderer.render(scene, rig.activeCamera);
   } else {
     slicer.compute(terrain, slicer.headingDeg * DEG, slicer.lineCount);
-    if (state.showPlanes) {
-      slicer.updateCurtainColors(rig.activeCamera);
-      fillRenderer.render(fillScene, rig.activeCamera);
-    } else {
-      fillRenderer.clear();
-    }
-    if (state.showLines) {
-      drawSliceFrame(lineCanvas, lctx, slicer.renderScale, window.innerWidth, window.innerHeight, true);
-    } else {
-      lctx.setTransform(1, 0, 0, 1, 0, 0);
-      lctx.clearRect(0, 0, lineCanvas.width, lineCanvas.height);
-    }
+    drawSliceFrame(lineCanvas, lctx, slicer.renderScale, window.innerWidth, window.innerHeight, true);
     $('sliceInfo').textContent =
       `${slicer.numSlices} lines · spacing ${slicer.spacing.toFixed(3)} · ${(slicer._totalPoints())} pts`;
   }
 }
 
 // Render the slice view into a 2D context at the given scale (device px per
-// CSS px). Shared by the display canvas and the PNG exporter.
+// CSS px). Shared by the display canvas and the PNG exporter — the screen and
+// the saved file are produced by the exact same drawing code.
 function drawSliceFrame(canvas, ctx, scale, w, h, clear) {
-  const depth = renderDepthBuffer();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   if (clear) ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
-  slicer.render(ctx, rig.activeCamera, terrain, w, h, depth);
+  slicer.render(ctx, rig.activeCamera, terrain, w, h, state.showPlanes, state.showLines);
 }
 
 // small helper attached to slicer for the status line
@@ -431,8 +347,6 @@ function resize() {
   renderer.setSize(w, h, false);
   rig.setViewHeight(h);
   resizeLineCanvas();
-  resizeDepthRT();
-  resizeFillRenderer();
   invalidate();
 }
 resize();
@@ -440,8 +354,5 @@ loadSample();
 setMode('slices');
 setLocked(true);
 // exposed for debugging / automated tests
-window.__app = { terrain, rig, slicer, state, mesh, scene, renderer, invalidate,
-  get depthStats() { return lastDepthStats; },
-  get depthData() { return { data: depthData, w: depthRT.width, h: depthRT.height }; },
-  get depthRaw() { return depthBuf; } };
+window.__app = { terrain, rig, slicer, state, mesh, scene, renderer, invalidate };
 requestAnimationFrame(tick);
