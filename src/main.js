@@ -119,9 +119,10 @@ function setMode(m) {
 }
 
 function setHeightPct(pct) {
-  terrain.heightScale = (pct / 100) * WORLD_SIZE;
+  // 100% = the previous default vertical scale (20% of the terrain width);
+  // values above/below exaggerate or flatten from there.
+  terrain.heightScale = (pct / 100) * WORLD_SIZE * 0.2;
   mesh.scale.y = terrain.heightScale;
-  slicer.setCurtainScale(terrain.heightScale);
   rig.bounds = { size: WORLD_SIZE, height: terrain.heightScale };
   rig.target.y = terrain.heightScale / 2;
   $('heightVal').textContent = `${pct}%`;

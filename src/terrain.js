@@ -15,7 +15,7 @@ export class Terrain {
     this.h = new Float32Array(0); // normalized [0,1], row-major, row 0 = "top" (far side, -z)
     this.rawMin = 0;
     this.rawMax = 0;
-    this.heightScale = WORLD_SIZE * 0.2; // world units
+    this.heightScale = WORLD_SIZE * 0.2; // world units (100% on the slider)
     this.version = 0;
     this.info = '';
   }

@@ -65,8 +65,9 @@ Production build: `npm run build` (output in `dist/`, serve with any static serv
     first channel is used as height),
   - **PNG heightmap** including 16-bit PNGs (grayscale or RGB; first channel
     is used).
-  Heights are normalized to the file's min..max range; *Height scale* sets the
-  world-space height as a percentage of the terrain width.
+  Heights are normalized to the file's min..max range; *Height scale* is a
+  vertical exaggeration factor around the default scale (100%), so higher
+  values stretch the terrain taller and lower values flatten it.
 - **Save PNG** — exports the current view. In slices mode the view is
   re-rendered offscreen at 2× supersampling (or at the selected
   supersampling level when higher), with the background color baked in.
