@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { samplePalette, rgbToCss, hexToRgb, srgbToLinear } from './palette.js';
 
 const MAX_SLICES = 800;
 const SAMPLE_BUDGET = 400000; // total samples across all slices per recompute
@@ -49,6 +50,14 @@ export class SliceRenderer {
     this.depthBias = 1.5;   // visibility bias in grid cells (covers rasterization/sampling mismatch)
     this.dpEpsMult = 0.5;   // decimation epsilon multiplier (0 = full detail)
     this.debugSlice = -1;   // when >= 0, draw only this slice (debugging)
+    // Line coloring
+    this.lineColorMode = 'gradient';    // 'static' | 'gradient'
+    this.linePalette = null;            // { mode: 'rgb'|'hsv', stops: [{t, color:[r,g,b]}] }, set by main
+    // Curtain ("slice plane") coloring — always palette-based
+    this.curtainPalette = null;
+    this._sliceColors = []; // css color per slice index, recomputed per frame
+    this._dists = new Float32Array(0);  // camera-plane distance per slice
+    this._sliceColRgb = [];             // [r,g,b] per slice for the fill layer
 
     this.key = null;
     this.nx = 0; this.nz = 1;
@@ -67,7 +76,9 @@ export class SliceRenderer {
     // between planes must never occlude (looking between planes must show
     // what is behind them).
     this.curtainPos = new Float32Array(0); // xyz per vertex, y normalized (mesh scale.y = heightScale)
+    this.curtainCol = new Float32Array(0); // rgb per vertex (linear 0..1), written per frame
     this.curtainIdx = new Uint32Array(0);  // 6 indices per segment
+    this.curtainVertBase = new Int32Array(0); // first vertex index per slice
     this._curtainGeo = new THREE.BufferGeometry();
     this._applyCurtainAttributes();
     this.curtainMesh = new THREE.Mesh(this._curtainGeo, new THREE.ShaderMaterial({
@@ -76,6 +87,13 @@ export class SliceRenderer {
       side: THREE.DoubleSide,
     }));
     this.curtainMesh.frustumCulled = false;
+    // Colored twin of the curtain mesh for the visible "plane bands"
+    // (rendered by main.js into a separate transparent WebGL layer).
+    this.fillMesh = new THREE.Mesh(this._curtainGeo, new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+    }));
+    this.fillMesh.frustumCulled = false;
 
     this._scratch = new Float32Array(1600 * 3);
     this._keep = new Uint8Array(1600);
@@ -88,14 +106,79 @@ export class SliceRenderer {
     this._m = new THREE.Matrix4();
   }
 
+  /** Both curtain consumers must match the terrain's vertical scale. */
+  setCurtainScale(h) {
+    this.curtainMesh.scale.y = h;
+    this.fillMesh.scale.y = h;
+  }
+
   _applyCurtainAttributes() {
     this._curtainGeo.setAttribute('position',
       new THREE.BufferAttribute(this.curtainPos, 3).setUsage(THREE.DynamicDrawUsage));
+    this._curtainGeo.setAttribute('color',
+      new THREE.BufferAttribute(this.curtainCol, 3).setUsage(THREE.DynamicDrawUsage));
     this._curtainGeo.setIndex(
       new THREE.BufferAttribute(this.curtainIdx, 1).setUsage(THREE.DynamicDrawUsage));
   }
 
   invalidate() { this.key = null; }
+
+  /**
+   * Per-slice color as [r,g,b] (0..255): sampled from the palette by the
+   * slice's perpendicular distance from the camera (nearest = left palette
+   * end, farthest = right end), or null when palette coloring is off
+   * (callers fall back to the flat line color).
+   */
+  sliceColorsRgb(camera, gradient, palette) {
+    const nS = this.numSlices;
+    if (nS === 0) return null;
+    if (!(gradient && palette && palette.stops && palette.stops.length)) {
+      return null;
+    }
+    const pos = camera.position;
+    const ref = this.nx * pos.x + this.nz * pos.z;
+    let dmin = Infinity, dmax = -Infinity;
+    const dists = this._dists = _grow(this._dists, nS);
+    for (let i = 0; i < nS; i++) {
+      const d = Math.abs(this.cvals[i] - ref);
+      dists[i] = d;
+      if (d < dmin) dmin = d;
+      if (d > dmax) dmax = d;
+    }
+    const dr = dmax - dmin;
+    const out = this._sliceColRgb = _grow(this._sliceColRgb, nS);
+    for (let i = 0; i < nS; i++) {
+      const t = dr > 1e-9 ? (dists[i] - dmin) / dr : 0.5;
+      out[i] = samplePalette(palette, t);
+    }
+    return out;
+  }
+
+  /**
+   * Write the per-slice colors into the curtain mesh's color attribute
+   * (converted to linear space for GPU rendering). Call before rendering the
+   * fill layer; colors change whenever the camera or palette changes.
+   */
+  updateCurtainColors(camera) {
+    const nS = this.numSlices;
+    if (nS === 0) return;
+    const colAttr = this._curtainGeo.attributes.color;
+    if (!colAttr) return;
+    const cols = this.sliceColorsRgb(camera, true, this.curtainPalette);
+    if (!cols) return; // no valid curtain palette
+    const arr = colAttr.array;
+    for (let si = 0; si < nS; si++) {
+      const c = cols[si];
+      const r = srgbToLinear(c[0]), g = srgbToLinear(c[1]), b = srgbToLinear(c[2]);
+      const vBase = this.curtainVertBase[si], n = this.count[si];
+      for (let k = 0; k < n; k++) {
+        const vi = (vBase + k * 2) * 3;
+        arr[vi] = r; arr[vi + 1] = g; arr[vi + 2] = b;
+        arr[vi + 3] = r; arr[vi + 4] = g; arr[vi + 5] = b;
+      }
+    }
+    colAttr.needsUpdate = true;
+  }
 
   compute(terrain, headingRad, lineCount) {
     const key = `${terrain.version}|${headingRad.toFixed(5)}|${lineCount}|${this.dpEpsMult}`;
@@ -196,13 +279,16 @@ export class SliceRenderer {
     const needV = totalPts * 2, needI = totalSegs * 6;
     if (this.curtainPos.length < needV * 3 || this.curtainIdx.length < needI) {
       this.curtainPos = new Float32Array(Math.max(needV * 3, (this.curtainPos.length * 1.5) | 0));
+      this.curtainCol = new Float32Array(this.curtainPos.length);
       this.curtainIdx = new Uint32Array(Math.max(needI, (this.curtainIdx.length * 1.5) | 0));
       this._applyCurtainAttributes();
     }
+    this.curtainVertBase = _grow(this.curtainVertBase, this.numSlices);
     const pts = this.pts, pos = this.curtainPos, idx = this.curtainIdx;
     let v = 0, ic = 0;
     for (let si = 0; si < this.numSlices; si++) {
       const s0 = this.start[si], n = this.count[si];
+      this.curtainVertBase[si] = v;
       const vBase = v;
       for (let k = 0; k < n; k++) {
         const p = (s0 + k) * 3, q = v * 3;
@@ -299,6 +385,14 @@ export class SliceRenderer {
       keys[i] = Math.abs(cv[i] - sigmaRef);
     }
     order.sort((a, b) => keys[b] - keys[a]);
+
+    // Slice colors by camera distance (shared with the curtain fill layer).
+    const colsRgb = this.sliceColorsRgb(camera, this.lineColorMode === 'gradient', this.linePalette);
+    let sliceColors = null;
+    if (colsRgb) {
+      sliceColors = this._sliceColors = _grow(this._sliceColors, nS);
+      for (let i = 0; i < nS; i++) sliceColors[i] = rgbToCss(colsRgb[i]);
+    }
 
     const hs = terrain.heightScale;
     const pts = this.pts, sxr = this._sx, syr = this._sy, svr = this._sv;
@@ -425,7 +519,7 @@ export class SliceRenderer {
         subPair(pts[j * 3], pts[j * 3 + 1] * hs, pts[j * 3 + 2], sxr[j], syr[j], stA,
           pts[j * 3 + 3], pts[j * 3 + 4] * hs, pts[j * 3 + 5], sxr[j + 1], syr[j + 1], stB, 0);
       }
-      ctx.strokeStyle = this.color;
+      ctx.strokeStyle = sliceColors ? sliceColors[si] : this.color;
       ctx.lineWidth = this.thickness;
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';

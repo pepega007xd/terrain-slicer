@@ -7,6 +7,7 @@
 </head>
 <body>
   <canvas id="gl"></canvas>
+  <canvas id="fills"></canvas>
   <canvas id="lines"></canvas>
 
   <aside id="panel">
@@ -32,6 +33,7 @@
       </div>
       <label>Projection <span id="projVal">Perspective</span></label>
       <input type="range" id="proj" min="0" max="100" step="1" value="0" />
+      <div class="row"><label>Sky / background</label><input type="color" id="bgColor" value="#000000" /></div>
     </section>
 
     <section>
@@ -48,8 +50,13 @@
 
     <section>
       <h3>Line style</h3>
-      <div class="row"><label>Color</label><input type="color" id="lineColor" value="#ffffff" /></div>
-      <div class="row"><label>Background</label><input type="color" id="bgColor" value="#000000" /></div>
+      <label class="chk"><input type="checkbox" id="showLines" checked /> Lines</label>
+      <div class="seg" id="lineColorMode">
+        <button id="lineModeStatic">Static</button>
+        <button id="lineModeGradient" class="on">Gradient</button>
+      </div>
+      <div class="row" id="lineFlatRow" style="display:none"><label>Color</label><input type="color" id="lineColor" value="#ffffff" /></div>
+      <div id="linePaletteEditor" class="palette-editor"></div>
       <label>Thickness <span id="thickVal">1.00</span></label>
       <input type="range" id="thickness" min="0.25" max="10" step="0.25" value="1" />
       <label>Antialiasing</label>
@@ -59,6 +66,12 @@
         <option value="3">3× supersampling</option>
         <option value="4">4× supersampling</option>
       </select>
+    </section>
+
+    <section>
+      <h3>Slice style</h3>
+      <label class="chk"><input type="checkbox" id="showPlanes" checked /> Planes</label>
+      <div id="planePaletteEditor" class="palette-editor"></div>
     </section>
 
     <section>

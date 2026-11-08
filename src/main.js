@@ -6,6 +6,8 @@ import { Terrain, WORLD_SIZE, buildTerrainGeometry } from './terrain.js';
 import { generateSampleHeights } from './sampleTerrain.js';
 import { CameraRig } from './cameraRig.js';
 import { SliceRenderer } from './slicer.js';
+import { defaultLinePalette, defaultPlanePalette } from './palette.js';
+import { createPaletteWidget } from './paletteUI.js';
 
 const $ = (id) => document.getElementById(id);
 const DEG = Math.PI / 180;
@@ -13,7 +15,9 @@ const DEG = Math.PI / 180;
 const terrain = new Terrain();
 const rig = new CameraRig();
 const slicer = new SliceRenderer();
-const state = { mode: 'slices' };
+slicer.linePalette = defaultLinePalette();
+slicer.curtainPalette = defaultPlanePalette();
+const state = { mode: 'slices', showLines: true, showPlanes: true };
 
 // --- three.js setup -------------------------------------------------------
 const glCanvas = $('gl');
@@ -45,6 +49,22 @@ let lastDepthStats = null;
 const DEPTH_SCALE = 0.5; // fraction of CSS viewport size
 const depthScene = new THREE.Scene();
 depthScene.add(slicer.curtainMesh);
+
+// --- colored curtain fills (the visible bands between the lines) -----------
+// A second transparent WebGL layer under the 2D line canvas renders the
+// curtain mesh with per-slice vertex colors; the GPU depth test resolves
+// curtain-vs-curtain occlusion exactly, and the sky stays transparent so the
+// background color shows through.
+const fillCanvas = $('fills');
+const fillRenderer = new THREE.WebGLRenderer({ canvas: fillCanvas, alpha: true, antialias: true });
+fillRenderer.setClearColor(0x000000, 0);
+const fillScene = new THREE.Scene();
+fillScene.add(slicer.fillMesh);
+
+function resizeFillRenderer() {
+  fillRenderer.setPixelRatio(dpr());
+  fillRenderer.setSize(window.innerWidth, window.innerHeight, false);
+}
 
 function resizeDepthRT() {
   const w = Math.max(2, Math.round(window.innerWidth * DEPTH_SCALE));
@@ -107,7 +127,7 @@ function applyTerrain() {
   mesh.geometry.dispose();
   mesh.geometry = buildTerrainGeometry(terrain, 1024);
   mesh.scale.y = terrain.heightScale;
-  slicer.curtainMesh.scale.y = terrain.heightScale;
+  slicer.setCurtainScale(terrain.heightScale);
   rig.bounds = { size: WORLD_SIZE, height: terrain.heightScale };
   rig.target.y = terrain.heightScale / 2;
   $('terrainInfo').textContent =
@@ -171,7 +191,7 @@ function setMode(m) {
 function setHeightPct(pct) {
   terrain.heightScale = (pct / 100) * WORLD_SIZE;
   mesh.scale.y = terrain.heightScale;
-  slicer.curtainMesh.scale.y = terrain.heightScale;
+  slicer.setCurtainScale(terrain.heightScale);
   rig.bounds = { size: WORLD_SIZE, height: terrain.heightScale };
   rig.target.y = terrain.heightScale / 2;
   $('heightVal').textContent = `${pct}%`;
@@ -223,7 +243,17 @@ function savePNG() {
     const cx = c.getContext('2d');
     cx.fillStyle = slicer.bgColor;
     cx.fillRect(0, 0, c.width, c.height);
-    drawSliceFrame(c, cx, scale, w, h, false);
+    if (state.showPlanes) {
+      // render the colored curtain fills at the export resolution too
+      fillRenderer.setPixelRatio(1);
+      fillRenderer.setSize(c.width, c.height, false);
+      slicer.updateCurtainColors(rig.activeCamera);
+      fillRenderer.render(fillScene, rig.activeCamera);
+      cx.drawImage(fillCanvas, 0, 0, c.width, c.height);
+      fillRenderer.setPixelRatio(dpr());
+      fillRenderer.setSize(w, h, false);
+    }
+    if (state.showLines) drawSliceFrame(c, cx, scale, w, h, false);
     out = c;
   }
   out.toBlob((blob) => {
@@ -279,6 +309,30 @@ function wireUI() {
   });
 
   $('lineColor').addEventListener('input', (e) => { slicer.color = e.target.value; invalidate(); });
+  $('showLines').addEventListener('change', (e) => {
+    state.showLines = e.target.checked;
+    invalidate();
+  });
+  const linePalWidget = createPaletteWidget($('linePaletteEditor'), slicer.linePalette, invalidate);
+  const setLineColorMode = (m) => {
+    slicer.lineColorMode = m;
+    $('lineModeStatic').classList.toggle('on', m === 'static');
+    $('lineModeGradient').classList.toggle('on', m === 'gradient');
+    $('lineFlatRow').style.display = m === 'static' ? '' : 'none';
+    $('linePaletteEditor').style.display = m === 'gradient' ? '' : 'none';
+    if (m === 'gradient') linePalWidget.redraw(); // bar width is 0 while hidden
+    invalidate();
+  };
+  $('lineModeStatic').addEventListener('click', () => setLineColorMode('static'));
+  $('lineModeGradient').addEventListener('click', () => setLineColorMode('gradient'));
+  setLineColorMode('gradient');
+
+  $('showPlanes').addEventListener('change', (e) => {
+    state.showPlanes = e.target.checked;
+    invalidate();
+  });
+  createPaletteWidget($('planePaletteEditor'), slicer.curtainPalette, invalidate);
+
   $('bgColor').addEventListener('input', (e) => {
     slicer.bgColor = e.target.value;
     document.body.style.setProperty('--slice-bg', e.target.value);
@@ -332,7 +386,18 @@ function tick() {
     renderer.render(scene, rig.activeCamera);
   } else {
     slicer.compute(terrain, slicer.headingDeg * DEG, slicer.lineCount);
-    drawSliceFrame(lineCanvas, lctx, slicer.renderScale, window.innerWidth, window.innerHeight, true);
+    if (state.showPlanes) {
+      slicer.updateCurtainColors(rig.activeCamera);
+      fillRenderer.render(fillScene, rig.activeCamera);
+    } else {
+      fillRenderer.clear();
+    }
+    if (state.showLines) {
+      drawSliceFrame(lineCanvas, lctx, slicer.renderScale, window.innerWidth, window.innerHeight, true);
+    } else {
+      lctx.setTransform(1, 0, 0, 1, 0, 0);
+      lctx.clearRect(0, 0, lineCanvas.width, lineCanvas.height);
+    }
     $('sliceInfo').textContent =
       `${slicer.numSlices} lines · spacing ${slicer.spacing.toFixed(3)} · ${(slicer._totalPoints())} pts`;
   }
@@ -367,6 +432,7 @@ function resize() {
   rig.setViewHeight(h);
   resizeLineCanvas();
   resizeDepthRT();
+  resizeFillRenderer();
   invalidate();
 }
 resize();

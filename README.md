@@ -23,8 +23,7 @@ Production build: `npm run build` (output in `dist/`, serve with any static serv
   never look at the terrain from below), wheel: zoom, right-drag / Shift-drag:
   pan.
 - **Shaded view** — a simple lit view of the terrain, just to see it.
-- **Slices view** — the output view: white lines on black (configurable), with
-  these controls:
+- **Slices view** — the output view (default), with these controls:
   - *Lock heading to camera* — planes stay orthogonal to the camera heading
     while you orbit. Uncheck to set the heading manually.
   - *Heading* — azimuth of the plane normals (0–360°).
@@ -45,6 +44,18 @@ Production build: `npm run build` (output in `dist/`, serve with any static serv
     point is depth-tested against them, which stays correct from any view
     direction (top-down, parallel to the planes, zoomed in, …) while being
     faster than per-line screen-space erasing.
+  - *Line style* — *Lines* toggle; color mode as two joined buttons,
+    **Static** (flat color) or **Gradient** (palette by distance); thickness;
+    and antialiasing (off/2×/3×/4× supersampling).
+  - *Slice style* — *Planes* toggle (the curtains below the lines) and its own
+    gradient palette, always distance-based (nearest bands `#241f31`, fading
+    to black in the distance).
+  - **Palette editor** (Gradient mode) — click the gradient bar to add stops,
+    drag stops to move them, double-click a stop to open the color picker,
+    right-click a stop to delete it, and interpolate between stops in RGB or
+    HSV. The nearest slice maps to the left end of the palette and the
+    farthest to the right end. The sky keeps its own background color (View
+    section).
 - **Projection** — slider from full perspective to true orthographic. Framing
   is preserved while blending.
 - **Terrain** — load via the button or by dropping a file anywhere:
