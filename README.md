@@ -1,5 +1,9 @@
 # Terrain Slicer
 
+### This was 100% ✨vibecoded✨
+
+### Hosted at [kentus.eu/terrain-slicer](https://kentus.eu/terrain-slicer/)
+
 A web tool for viewing terrain as **ridge-line slices**: many parallel, evenly
 spaced vertical planes intersect the terrain, and the intersection curves are
 rendered far-to-near, painter's-algorithm style — each slice fills its plane
