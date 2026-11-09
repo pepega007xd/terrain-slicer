@@ -59,6 +59,8 @@ export class SliceRenderer {
     this._sx = new Float32Array(0);
     this._sy = new Float32Array(0);
     this._sv = new Uint8Array(0);
+    this._gx = new Float32Array(0);
+    this._gy = new Float32Array(0);
     this._order = new Int32Array(0);
     this._dists = new Float32Array(0);  // camera-plane distance per slice
     this._sliceColors = [];             // css color per slice index
@@ -135,6 +137,8 @@ export class SliceRenderer {
     this._sx = grow(this._sx, maxPts);
     this._sy = grow(this._sy, maxPts);
     this._sv = grow(this._sv, maxPts);
+    this._gx = grow(this._gx, maxPts);
+    this._gy = grow(this._gy, maxPts);
 
     const pts = this.pts;
     const invGx = (gw - 1) / sx, invGz = (gh - 1) / sz;
@@ -252,12 +256,12 @@ export class SliceRenderer {
 
     const hs = terrain.heightScale;
     const pts = this.pts, sxr = this._sx, syr = this._sy, svr = this._sv;
+    const gxr = this._gx, gyr = this._gy;
     const m0 = e[0], m4 = e[4], m8 = e[8], m12 = e[12];
     const m1 = e[1], m5 = e[5], m9 = e[9], m13 = e[13];
     const m2 = e[2], m6 = e[6], m10 = e[10], m14 = e[14];
     const m3 = e[3], m7 = e[7], m11 = e[11], m15 = e[15];
     const pad = 64;
-    const yBottom = h + 64;
 
     const lineCols = this.sliceColorsRgb(camera, this.lineColorMode === 'gradient', this.linePalette);
     const fillCols = this.sliceColorsRgb(camera, true, this.curtainPalette);
@@ -273,23 +277,33 @@ export class SliceRenderer {
       for (let k = 0; k < n; k++) {
         const pi = (s0 + k) * 3;
         const x = pts[pi], y = pts[pi + 1] * hs, z = pts[pi + 2];
-        const vz = vz2 * x + vz6 * y + vz10 * z + vz14;
-        const cw = m3 * x + m7 * y + m11 * z + m15;
-        let ok = vz < -near && cw > 1e-9;
-        let px = 0, py = 0;
+        // project the curve point and its ground projection (y = 0): the fill
+        // polygon is the true projected curtain between the two
+        const vzC = vz2 * x + vz6 * y + vz10 * z + vz14;
+        const cwC = m3 * x + m7 * y + m11 * z + m15;
+        const vzG = vz2 * x + vz10 * z + vz14;
+        const cwG = m3 * x + m11 * z + m15;
+        let ok = vzC < -near && cwC > 1e-9 && vzG < -near && cwG > 1e-9;
+        let px = 0, py = 0, gx = 0, gy = 0;
         if (ok) {
-          const inv = 1 / cw;
+          const inv = 1 / cwC;
           px = ((m0 * x + m4 * y + m8 * z + m12) * inv * 0.5 + 0.5) * w;
           py = (0.5 - (m1 * x + m5 * y + m9 * z + m13) * inv * 0.5) * h;
-          if (!Number.isFinite(px) || !Number.isFinite(py)) ok = false;
+          const invG = 1 / cwG;
+          gx = ((m0 * x + m8 * z + m12) * invG * 0.5 + 0.5) * w;
+          gy = (0.5 - (m1 * x + m9 * z + m13) * invG * 0.5) * h;
+          if (!Number.isFinite(px) || !Number.isFinite(py) ||
+            !Number.isFinite(gx) || !Number.isFinite(gy)) ok = false;
         }
         sxr[s0 + k] = px; syr[s0 + k] = py; svr[s0 + k] = ok ? 1 : 0;
+        gxr[s0 + k] = gx; gyr[s0 + k] = gy;
         if (!ok) dbg.ptsCulled++;
         else {
           anyProj = true;
           if (px < minx) minx = px;
           if (px > maxx) maxx = px;
           if (py < miny) miny = py;
+          if (gy < miny) miny = gy;
         }
       }
       if (!anyProj) { dbg.noValid++; continue; }
@@ -306,15 +320,19 @@ export class SliceRenderer {
           if (runEnd > runStart) {
             const x0p = sxr[s0 + runStart], y0p = syr[s0 + runStart];
             strokePath.moveTo(x0p, y0p);
-            if (fillPath) fillPath.moveTo(x0p, y0p);
             for (let q = runStart + 1; q <= runEnd; q++) {
               strokePath.lineTo(sxr[s0 + q], syr[s0 + q]);
-              if (fillPath) fillPath.lineTo(sxr[s0 + q], syr[s0 + q]);
             }
             if (fillPath) {
-              // the curtain: from the curve down to the bottom of the frame
-              fillPath.lineTo(sxr[s0 + runEnd], yBottom);
-              fillPath.lineTo(x0p, yBottom);
+              // the curtain: the true projected plane section — the curve
+              // along the top, its ground trace along the bottom
+              fillPath.moveTo(x0p, y0p);
+              for (let q = runStart + 1; q <= runEnd; q++) {
+                fillPath.lineTo(sxr[s0 + q], syr[s0 + q]);
+              }
+              for (let q = runEnd; q >= runStart; q--) {
+                fillPath.lineTo(gxr[s0 + q], gyr[s0 + q]);
+              }
               fillPath.closePath();
             }
           }

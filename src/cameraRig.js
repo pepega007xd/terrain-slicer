@@ -22,7 +22,7 @@ export class CameraRig {
     this.target = new THREE.Vector3(0, 1, 0);
     this.yaw = 25 * DEG;
     this.elevation = 33 * DEG;
-    this.frame = 18;
+    this.frame = 8;
     this.persp = 0;
     this.bounds = { size: WORLD_SIZE, height: 2 };
     this.dirty = true;
@@ -74,7 +74,7 @@ export class CameraRig {
   reset() {
     this.yaw = 25 * DEG;
     this.elevation = 33 * DEG;
-    this.frame = 18;
+    this.frame = 8;
     this.target.set(0, this.bounds.height / 2, 0);
     this.dirty = true;
   }
